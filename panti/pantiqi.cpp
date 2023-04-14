@@ -4,7 +4,7 @@
 #include<string>
 #include<algorithm>
 #include<map>
-#include<limits.h>
+#include<climits>
 #include<deque>
 #include <cmath>
 
@@ -247,13 +247,14 @@ int main() {
     double bestscore = 0;
     string path;
     while (true) {
-        path = "../big_data/" + to_string(No);
+        path = "../data/" + to_string(No);
         if (!Input(path, flows, ports, res))
             break;
         int thistime = algorithm(flows, ports, res);
         double thisbest = best(flows, ports);
         alltime += thistime;
         allbest += thisbest;
+        cout << "-------------" << "No：" << No << "-------------" << endl;
         cout << "best time in theory：" << thisbest << endl;
         cout << "real time：" << thistime << endl;
         cout << "score：" << 100 / (log(thistime) / log(10)) << endl;

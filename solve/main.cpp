@@ -1,5 +1,5 @@
-//#pragma GCC optimize(3)
-//#pragma GCC optimize("inline")
+#pragma GCC optimize(3)
+#pragma GCC optimize("inline")
 
 #include <iostream>
 #include <sstream>
@@ -10,6 +10,8 @@
 #include "fstream"
 #include "map"
 #include "set"
+#include "queue"
+#include "list"
 
 class Flow {
 public:
@@ -39,11 +41,6 @@ public:
 };
 
 class Port {
-public:
-    int id;
-    int bandwidth_capacity;
-    std::map<int, int> heights_capacity; // key: 高度, value: 该高度的带宽容量
-    std::map<int, std::vector<Flow *>> heights_flows; // key: 高度, value: 该高度上的flows, 储存了flow的指针
 
 public:
     Port(int id, int bandwidth_capacity) {
@@ -51,6 +48,21 @@ public:
         this->bandwidth_capacity = bandwidth_capacity;
         this->heights_capacity.insert(std::make_pair(0, bandwidth_capacity));
     }
+
+    // 供flows_info优先队列使用的比较仿函数，按照剩余时间从小到大排序
+    struct cmp {
+        bool operator()(const std::pair<int, int> &a, const std::pair<int, int> &b) {
+            return a.first > b.first;
+        }
+    };
+
+public:
+    int id;
+    int bandwidth_capacity;
+    std::map<int, int> heights_capacity; // key: 高度, value: 该高度的带宽容量
+    std::map<int, std::vector<Flow *>> heights_flows; // key: 高度, value: 该高度上的flows, 储存了flow的指针
+    // list of (remaining_time, bandwidth)
+    std::list<std::pair<int, int>> occupies; // 储存了每个flow的剩余时间和带宽
 };
 
 void read_files(const std::string &data_path, std::vector<Flow> &flows, std::vector<Port> &ports) {
@@ -97,167 +109,175 @@ void write_sorted_flows(const std::string &data_path, const std::vector<Flow> &f
     file.close();
 }
 
-/* 放置flow的平台必须要求容量大于flow的带宽 */
-void pass_flow(Port &port, Flow &flow, int send_time) {
-    // 更新flow
-    flow.is_sent = true;
-    flow.send_time = send_time;
-    flow.send_port = port.id;
-    flow.real_leave_time =
-            send_time < flow.coming_time ? flow.coming_time + flow.occupied_time : send_time + flow.occupied_time;
-    // 更新port
-    // 基座带宽容量减少
-    port.heights_capacity[send_time] -= flow.bandwidth;
-    port.heights_flows[send_time].push_back(&flow);
-    // 顶部搭建带宽容量增加
-    if (port.heights_capacity.find(flow.real_leave_time) == port.heights_capacity.end()) {
-        port.heights_capacity[flow.real_leave_time] = flow.bandwidth;
-    } else {
-        port.heights_capacity[flow.real_leave_time] += flow.bandwidth;
+//ports排序按照bandwidth_capacity将序构造优先队列的仿函数
+struct ports_queue_cmp {
+    bool operator()(const Port &a, const Port &b) {
+        return a.bandwidth_capacity < b.bandwidth_capacity;
     }
-}
-
-void put_flow(Flow &flow, std::vector<Port> &ports, std::vector<Flow> &flows) {
-    std::vector<std::pair<Port *, std::pair<int, int>>> port_best_capacities;  // (port_id, (height, capacity))，height不超过flow.coming_time
-    //遍历端口
-    for (auto &port: ports) {
-        if (port.heights_capacity.find(flow.coming_time) == port.heights_capacity.end()) {
-            // 该端口内尚未堆叠流的到达时平台
-            // 逐高度向上寻找，直到找到一个高度，该高度的带宽容量足够，添加进后续优选列表
-            for (auto it = port.heights_capacity.begin(); it != port.heights_capacity.end(); it++) {
-                if (it->first <= flow.coming_time && it->second >= flow.bandwidth) {
-                    port_best_capacities.emplace_back(&port, std::make_pair(it->first, it->second));
-                    break;
-                }
-            }
-            // 执行到这，说明该端口内尚未堆叠流的到达时平台，且该端口内没有高度的带宽容量足够，添加距流到达时最近高度的带宽容量(后续必然会进入回溯替换or非最佳放置的流程)
-            // 该方案优先选择尽量压缩纵向空隙带来的损失，尚未考虑横向超出部分带来空隙的损失
-            for (auto it = port.heights_capacity.rbegin(); it != port.heights_capacity.rend(); it++) {
-                if (it->first <= flow.coming_time) {
-                    port_best_capacities.emplace_back(&port, std::make_pair(it->first, it->second));
-                    break;
-                }
-            }
-        } else {
-            // 该端口内堆叠有流的到达时平台
-            port_best_capacities.emplace_back(&port, std::make_pair(flow.coming_time,
-                                                                    port.heights_capacity[flow.coming_time]));
-        }
-    }
-    // 按照height降序->capacity降序排序
-    std::sort(port_best_capacities.begin(), port_best_capacities.end(),
-              [](const std::pair<Port *, std::pair<int, int>> &a,
-                 const std::pair<Port *, std::pair<int, int>> &b) {
-                  if (a.second.first != b.second.first) {
-                      return a.second.first > b.second.first;
-                  } else {
-                      return a.second.second > b.second.second;
-                  }
-              });
-    for (auto pair: port_best_capacities) { // for each port
-        Port &port = *pair.first;
-        int height = pair.second.first;
-        int height_capacity = pair.second.second;
-        if (height_capacity >= flow.bandwidth) {
-            pass_flow(port, flow, height);
-            return;
-        } else {
-            // 该端口该高度平台带宽不满足流的带宽需求，尝试在该高度为其腾出位置（挪开一个先前放置的流）
-            // 功能：查找是否能替换该平台上的其他已放置的流，使得该平台上的流的带宽容量足够放置本流，且剩余带宽容量减小
-            std::vector<Flow *> &flows_on_coming_time = port.heights_flows[flow.coming_time];
-            std::sort(flows_on_coming_time.begin(), flows_on_coming_time.end(),
-                      [](const Flow *a, const Flow *b) {
-                          return a->bandwidth < b->bandwidth;
-                      });
-            int now_capacity = port.heights_capacity[flow.coming_time];
-            for (auto flow_on_coming_time: flows_on_coming_time) {
-                int new_capacity = now_capacity + flow_on_coming_time->bandwidth - flow.bandwidth;
-                if (new_capacity > 0) {
-                    if (new_capacity < now_capacity && flow_on_coming_time->coming_time >= flow.coming_time) {
-                        // 该平台上的剔除原放置的一个流后余下带宽容量足够放置本流，且剩余带宽容量减小
-                        // 从该平台上的流的原位置移除
-                        port.heights_capacity[flow_on_coming_time->send_time] += flow_on_coming_time->bandwidth;
-                        auto &now_flows = port.heights_flows.find(flow_on_coming_time->send_time)->second;
-                        now_flows.erase(
-                                std::find(now_flows.begin(),
-                                          now_flows.end(),
-                                          flow_on_coming_time));
-                        // 原流顶部搭建平台容量减小
-                        if (port.heights_capacity[flow_on_coming_time->real_leave_time] ==
-                            flow_on_coming_time->bandwidth) {
-                            port.heights_capacity.erase(flow_on_coming_time->real_leave_time);
-                        } else {
-                            port.heights_capacity[flow_on_coming_time->real_leave_time] -= flow_on_coming_time->bandwidth;
-                        }
-                        // 将本流放置到该平台上的流的原位置
-                        pass_flow(port, flow, height);
-                        // 将挪走的流寻找新的位置放置，递归调用put_flow
-                        put_flow(*flow_on_coming_time, ports, flows);
-                        return;
-                    } else {
-                        // 替换原放置的一个流后，剩余带宽容量不减小，后续的flow_on_coming_time也不会减小，跳出循环
-                        break;
-                    }
-                } else {
-                    // 该平台上的剔除原放置的一个流后余下带宽容量不足以放置本流，尝试替换下一个更宽的流
-                    continue;
-                }
-            }
-            // 执行到此，该端口该平台无法替换流，跳过该端口
-        }
-    }
-    // 执行到此，本流无法于任何端口在best_leave_time离开
-    // 求每个端口的最大高度数组
-    std::vector<std::pair<Port *, int>> max_heights;  // <point to port, max_height>
-    max_heights.reserve(ports.size());
-    for (auto port: ports) {
-        max_heights.emplace_back(&port, port.heights_capacity.rbegin()->first);
-    }
-    // 若该流的coming_time已到达每个端口的最大高度，不能再继续递归
-    std::pair<Port *, int> max_height = *std::max_element(max_heights.begin(), max_heights.end(),
-                                                          [](const std::pair<Port *, int> &a,
-                                                             const std::pair<Port *, int> &b) {
-                                                              return a.second < b.second;
-                                                          });
-    if (flow.coming_time >= max_height.second) {
-        flow.is_sent = true;
-        flow.send_time = flow.coming_time;
-        flow.real_leave_time = flow.coming_time + flow.occupied_time;
-        // 一个很差的解决方案：该端口本流real_leave_time之前空间都舍弃
-        Port &port = *max_height.first;
-        port.heights_capacity.clear();
-        port.heights_flows.clear();
-        port.heights_capacity[flow.real_leave_time] = port.bandwidth_capacity;
-        return;
-    }
-    flow.coming_time++;
-    put_flow(flow, ports, flows);
-}
+};
 
 void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string &data_path) {
-    // flows排序按照best_leave_time升序->coming_time升序->bandwidth降序
+    std::ofstream file(data_path + "/result.txt");
+    // flows排序按照coming_time升序->occupied_time降序->bandwidth降序
     std::sort(flows.begin(), flows.end(), [](const Flow &a, const Flow &b) {
-        if (a.best_leave_time != b.best_leave_time) {
-            return a.best_leave_time < b.best_leave_time;
-        } else if (a.coming_time != b.coming_time) {
-            return a.coming_time < b.coming_time;
+        if (a.coming_time == b.coming_time) {
+            if (a.occupied_time == b.occupied_time) {
+                return a.bandwidth > b.bandwidth;
+            } else {
+                return a.occupied_time > b.occupied_time;
+            }
         } else {
-            return a.bandwidth > b.bandwidth;
+            return a.coming_time < b.coming_time;
         }
     });
     // 测试用，看flow样本特征
 //    write_sorted_flows(data_path, flows);
-    // ports按照bandwidth_capacity降序
-    std::sort(ports.begin(), ports.end(), [](const Port &a, const Port &b) {
-        return a.bandwidth_capacity > b.bandwidth_capacity;
-    });
-
-    for (auto &flow: flows) {
-        put_flow(flow, ports, flows);
-        std::cout << "flow " << flow.id << " is sent: " << flow.send_port << "\treal_leave_time: "
-                  << flow.real_leave_time << std::endl;
+    //ports排序按照bandwidth_capacity升序
+//    std::sort(ports.begin(), ports.end(), [](const Port &a, const Port &b) {
+//        return a.bandwidth_capacity < b.bandwidth_capacity;
+//    });
+    auto ports_num = ports.size();
+    // ports排序按照bandwidth_capacity降序，采用优先队列构造成最大堆
+    std::priority_queue<Port, std::vector<Port>, ports_queue_cmp> ports_queue;
+    for (auto &port: ports) {
+        ports_queue.push(port);
     }
-
+    // 等待放置的流队列
+    std::list<Flow *> flows_waiting_list;
+    // 计时器
+    int time = 0;
+    int now_coming_time = 0;
+    int last_coming_time = 0;
+    for (auto &flow: flows) {
+        now_coming_time = flow.coming_time;
+        if (now_coming_time > last_coming_time) {
+            // 当前时间大于上一个流到达时间，更新时间
+            time++;
+            last_coming_time = now_coming_time;
+            // 遍历端口，更新带宽容量
+            std::vector<Port> temp_ports;
+            while (!ports_queue.empty()) {
+                temp_ports.push_back(ports_queue.top());
+                ports_queue.pop();
+            }
+            for (auto &port: temp_ports) {
+                // 遍历port的occupies
+                for (auto it = port.occupies.begin(); it != port.occupies.end();) {
+                    if (it->first > 0) {
+                        it->first--;
+                        it++;
+                    } else {
+                        port.bandwidth_capacity += it->second;
+                        it = port.occupies.erase(it);
+                    }
+                }
+                ports_queue.push(port);
+            }
+            // 先遍历等待队列，看是否有流可以放置
+            for (auto it = flows_waiting_list.begin(); it != flows_waiting_list.end();) {
+                // 从最小堆中取出当前带宽容量最大的端口
+                Port port = ports_queue.top();
+                ports_queue.pop();
+                // 若本流带宽小于该端口带宽容量，放置本流
+                if ((*it)->bandwidth <= port.bandwidth_capacity) {
+                    // 更新flow的send_port
+                    (*it)->send_port = port.id;
+                    // 更新flow的send_time
+                    (*it)->send_time = time;
+                    // 写出安排结果
+                    file << (*it)->id << "," << (*it)->send_port << "," << (*it)->send_time << std::endl;
+                    // debug: print flow
+//                    std::cout << "flow " << (*it)->id << " is sent: " << (*it)->send_port << "\tsend_time: "
+//                              << (*it)->send_time << std::endl;
+                    // 更新port的带宽容量
+                    port.bandwidth_capacity -= (*it)->bandwidth;
+                    // 更新port的occupies
+                    port.occupies.emplace_back((*it)->occupied_time, (*it)->bandwidth);
+                    // 从等待队列中删除该流
+                    it = flows_waiting_list.erase(it);
+                } else {
+                    it++;
+                }
+                ports_queue.push(port);
+            }
+        }
+        // 从最小堆中取出当前带宽容量最大的端口
+        Port port = ports_queue.top();
+        ports_queue.pop();
+        // 若本流带宽小于该端口带宽容量，放置本流
+        if (flow.bandwidth <= port.bandwidth_capacity) {
+            // 更新flow的send_port
+            flow.send_port = port.id;
+            // 更新flow的send_time
+            flow.send_time = time;
+            // 写出安排结果
+            file << flow.id << "," << flow.send_port << "," << flow.send_time << std::endl;
+            // debug: print flow
+//            std::cout << "flow " << flow.id << " is sent: " << flow.send_port << "\tsend_time: "
+//                      << flow.send_time << std::endl;
+            // 更新port的带宽容量
+            port.bandwidth_capacity -= flow.bandwidth;
+            // 更新port的occupies
+            port.occupies.emplace_back(flow.occupied_time, flow.bandwidth);
+        } else {
+            // 若本流带宽大于该端口带宽容量，可知此时无法将本流放置任何端口，将本流加入等待下一时刻到来的队列中
+            flows_waiting_list.push_back(&flow);
+        }
+        // 将该端口放回最小堆
+        ports_queue.push(port);
+    }
+    // 读取flow结束，等待时间中的各流可视为同时到达
+    while (!flows_waiting_list.empty()) {
+        // 更新时间
+        time++;
+        // 遍历端口，更新带宽容量
+        std::vector<Port> temp_ports;
+        while (!ports_queue.empty()) {
+            temp_ports.push_back(ports_queue.top());
+            ports_queue.pop();
+        }
+        for (auto &port: temp_ports) {
+            // 遍历port的occupies
+            for (auto it = port.occupies.begin(); it != port.occupies.end();) {
+                if (it->first > 0) {
+                    it->first--;
+                    it++;
+                } else {
+                    port.bandwidth_capacity += it->second;
+                    it = port.occupies.erase(it);
+                }
+            }
+            ports_queue.push(port);
+        }
+        // 遍历等待队列，看是否有流可以放置
+        for (auto it = flows_waiting_list.begin(); it != flows_waiting_list.end();) {
+            // 从最小堆中取出当前带宽容量最大的端口
+            Port port = ports_queue.top();
+            ports_queue.pop();
+            // 若本流带宽小于该端口带宽容量，放置本流
+            if ((*it)->bandwidth <= port.bandwidth_capacity) {
+                // 更新flow的send_port
+                (*it)->send_port = port.id;
+                // 更新flow的send_time
+                (*it)->send_time = time;
+                // 写出安排结果
+                file << (*it)->id << "," << (*it)->send_port << "," << (*it)->send_time << std::endl;
+                // debug: print flow
+//                std::cout << "flow " << (*it)->id << " is sent: " << (*it)->send_port << "\tsend_time: "
+//                          << (*it)->send_time << std::endl;
+                // 更新port的带宽容量
+                port.bandwidth_capacity -= (*it)->bandwidth;
+                // 更新port的occupies
+                port.occupies.emplace_back((*it)->occupied_time, (*it)->bandwidth);
+                // 从等待队列中删除该流
+                it = flows_waiting_list.erase(it);
+            } else {
+                it++;
+            }
+            ports_queue.push(port);
+        }
+    }
+    file.close();
 }
 
 void write_result(const std::string &data_path, const std::vector<Flow> &flows) {
@@ -286,7 +306,7 @@ int main() {
             // 流调度
             solve(flows, ports, data_path);
             // 输出结果
-            write_result(data_path, flows);
+//            write_result(data_path, flows);
             data_num++;
         } else {
             // 终止遍历
