@@ -266,6 +266,7 @@ int main() {
         ports.clear();
         res.clear();
     }
+    cout << "-------------" << "sum" << "-------------" << endl;
     cout << "sum theory optimal：" << allbest << endl;
     cout << "sum actual results：" << alltime << endl;
     cout << "sum score：" << score / No << endl;
