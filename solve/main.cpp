@@ -32,7 +32,7 @@ public:
         this->occupied_time = occupied_time;
         this->send_time = -1;
         this->send_port = -1;
-        this->weight = bandwidth * occupied_time;  // TODO: 优化权重
+        this->weight = bandwidth / occupied_time;  // TODO: 优化权重
         this->best_leave_time = this->coming_time + this->occupied_time;
         this->real_leave_time = -1;
     }
@@ -107,14 +107,10 @@ struct ports_queue_cmp {
     }
 };
 
-// wait_queue的仿函数，按照bandwidth升序->occupied_time降序
+// wait_queue的仿函数，按照weight升序
 struct wait_queue_cmp {
     bool operator()(Flow &a, const Flow &b) {
-        if (a.bandwidth == b.bandwidth) {
-            return a.occupied_time < b.occupied_time;
-        } else {
-            return a.bandwidth > b.bandwidth;
-        }
+        return a.weight > b.weight;
     }
 };
 
@@ -204,7 +200,7 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
     });
     // 测试用，看flow样本特征
 //    write_sorted_flows(data_path, flows);
-    //ports排序按照bandwidth_capacity升序
+    // ports原地排序，按照bandwidth_capacity升序
 //    std::sort(ports.begin(), ports.end(), [](const Port &a, const Port &b) {
 //        return a.bandwidth_capacity < b.bandwidth_capacity;
 //    });
@@ -253,7 +249,6 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
         // 更新时间
         time++;
         put_success = true;
-//        std::cout << "time: " << time << std::endl;
         update_ports(ports_queue, bandwidth_changed);
         // 看等待队列中的首个流（带宽最小的）是否可以放置
         // 若首个流放置了，继续看等待队列中的首个流是否可以放置
@@ -283,8 +278,6 @@ int main() {
             read_files(data_path, flows, ports);
             // 流调度
             solve(flows, ports, data_path);
-            // 输出结果
-//            write_result(data_path, flows);
             data_num++;
         } else {
             // 终止遍历
