@@ -13,6 +13,8 @@
 #include "queue"
 #include "list"
 
+int MAX_POOL_SIZE;
+
 class Flow {
 public:
     int id;
@@ -32,7 +34,7 @@ public:
         this->occupied_time = occupied_time;
         this->send_time = -1;
         this->send_port = -1;
-        this->weight = bandwidth / occupied_time;  // TODO: 优化权重
+        this->weight = bandwidth + 1000*occupied_time;  // TODO: 优化权重
         this->best_leave_time = this->coming_time + this->occupied_time;
         this->real_leave_time = -1;
     }
@@ -41,16 +43,21 @@ public:
 class Port {
 public:
     int id;
+    int max_bandwidth;
     int bandwidth_capacity;
     int max_time; // port中已经占用的最大时间
     std::map<int, int> heights_capacity; // key: 高度, value: 该高度的带宽容量
     std::map<int, std::vector<Flow *>> heights_flows; // key: 高度, value: 该高度上的flows, 储存了flow的指针
     // list of (remaining_time, bandwidth)
-    std::list<std::pair<int, int>> occupies; // 储存了每个flow的剩余时间和带宽
+    // 储存了端口中已发送的每个flow的剩余时间和带宽
+    std::list<std::pair<int, int>> occupies;
+    // 端口的排队区
+    std::queue<Flow> wait_queue;
 
 public:
     Port(int id, int bandwidth_capacity) {
         this->id = id;
+        this->max_bandwidth=bandwidth_capacity;
         this->bandwidth_capacity = bandwidth_capacity;
         this->heights_capacity.insert(std::make_pair(0, bandwidth_capacity));
         this->max_time = 0;
@@ -122,14 +129,15 @@ bool put_flow(Flow &flow, int time, std::priority_queue<Port, std::vector<Port>,
     while (!ports_queue.empty()) {
         Port port = ports_queue.top();
         ports_queue.pop();
-        // 若本流未放置过，且本流带宽小于该端口带宽容量，放置本流
+        // 若本流未放置过，放置本流当：1.本流带宽小于该端口带宽容量；2.调度区已满且本流带宽小于该端口最大容量
         if (flow.send_port == -1 && flow.bandwidth <= port.bandwidth_capacity) {
             // 更新flow的send_port
             flow.send_port = port.id;
             // 更新flow的send_time
             flow.send_time = time;
             // 写出安排结果
-            file << flow.id << "," << flow.send_port << "," << flow.coming_time << std::endl;
+            int send_time = flow.send_time>flow.coming_time?flow.send_time:flow.coming_time;
+            file << flow.id << "," << flow.send_port << "," << send_time << std::endl;
             // debug: print flow
 //            std::cout << "flow " << flow.id << " is sent: " << flow.send_port << "\tsend_time: "
 //                      << flow.send_time << std::endl;
@@ -141,7 +149,24 @@ bool put_flow(Flow &flow, int time, std::priority_queue<Port, std::vector<Port>,
             temp_ports.push(port);
             // 跳出循环
             break;
-        } else {
+        } else if (flow.send_port == -1 && flow.bandwidth <= port.max_bandwidth && wait_queue.size()>=MAX_POOL_SIZE) {
+            // 更新flow的send_port
+            flow.send_port = port.id;
+            // 更新flow的send_time
+            flow.send_time = time;
+            // 写出安排结果
+            int send_time = flow.send_time>flow.coming_time?flow.send_time:flow.coming_time;
+            file << flow.id << "," << flow.send_port << "," << send_time << std::endl;
+            // debug: print flow
+//            std::cout << "flow " << flow.id << " is sent: " << flow.send_port << "\tsend_time: "
+//                      << flow.send_time << std::endl;
+            // send_port的排队区加入本流
+            port.wait_queue.push(flow);
+            // 将该端口放入临时队列中
+            temp_ports.push(port);
+            // 跳出循环
+            break;
+        } else{
             // 将该端口放入临时队列中
             temp_ports.push(port);
             // 查看下一个带宽容量更大的端口能否放下
@@ -153,7 +178,8 @@ bool put_flow(Flow &flow, int time, std::priority_queue<Port, std::vector<Port>,
         ports_queue.push(temp_ports.front());
         temp_ports.pop();
     }
-    // 结束时，若flow的send_port仍为-1，说明没有找到能放得下本流的端口，将本流放入等待队列
+    // 结束时，若flow的send_port仍为-1，说明没有找到能放得下本流的端口
+    // 将本流放回等待队列，等待队列不变
     if (flow.send_port == -1) {
         wait_queue.push(flow);
         return false;
@@ -180,6 +206,17 @@ void update_ports(std::priority_queue<Port, std::vector<Port>, ports_queue_cmp> 
                 bandwidth_changed = true;
             }
         }
+        // 若port排队区非空，且排队首元素带宽小于此时端口带宽容量，发出
+        if (!port.wait_queue.empty()) {
+            Flow first_flow=port.wait_queue.front();
+            if (first_flow.bandwidth<=port.bandwidth_capacity) {
+                // 更新port的带宽容量
+                port.bandwidth_capacity -= first_flow.bandwidth;
+                // 更新port的occupies
+                port.occupies.emplace_back(first_flow.occupied_time, first_flow.bandwidth);
+                port.wait_queue.pop();
+            }
+        }
         ports_queue.push(port);
     }
 }
@@ -200,10 +237,6 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
     });
     // 测试用，看flow样本特征
 //    write_sorted_flows(data_path, flows);
-    // ports原地排序，按照bandwidth_capacity升序
-//    std::sort(ports.begin(), ports.end(), [](const Port &a, const Port &b) {
-//        return a.bandwidth_capacity < b.bandwidth_capacity;
-//    });
     // ports排序按照bandwidth_capacity升序，采用优先队列构造成最小堆
     std::priority_queue<Port, std::vector<Port>, ports_queue_cmp> ports_queue;
     for (auto &port: ports) {
@@ -216,8 +249,12 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
     int time = 0;
     int now_coming_time;
     int last_coming_time = 0;
-    bool bandwidth_changed = false;  // 带宽是否发生变化
-    bool put_success;  // 放置流是否成功
+    // 调度区最大容量
+    MAX_POOL_SIZE = int(ports_queue.size())*20-1;
+    // 带宽是否发生变化
+    bool bandwidth_changed = false;
+    // 放置流是否成功
+    bool put_success;
     for (auto &flow: flows) {
         put_success = true;
         now_coming_time = flow.coming_time;
@@ -228,7 +265,7 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
             last_coming_time = now_coming_time;
             update_ports(ports_queue, bandwidth_changed);
             // 看等待队列中的首个流是否可以放置
-            // 若首个流放置了，继续看等待队列中的首个流是否可以放置 todo：改为若干个流？
+            // 若首个流放置了，继续看等待队列中的首num个流是否可以放置 todo：改为若干个流？
             while (!wait_queue.empty() && bandwidth_changed && put_success) {
                 Flow wait_flow = wait_queue.top();
                 wait_queue.pop();
@@ -237,7 +274,7 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
             bandwidth_changed = false;
         } else {
             // 看等待队列中的首个流是否可以放置
-            // 若首个流放置了，继续看等待队列中的首个流是否可以放置
+            // 若首个流放置了，继续看等待队列中的首num个流是否可以放置
             while (!wait_queue.empty() && put_success) {
                 Flow wait_flow = wait_queue.top();
                 wait_queue.pop();
@@ -252,7 +289,7 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
         put_success = true;
         update_ports(ports_queue, bandwidth_changed);
         // 看等待队列中的首个流是否可以放置
-        // 若首个流放置了，继续看等待队列中的首个流是否可以放置
+        // 若首个流放置了，继续看等待队列中的首num个流是否可以放置
         while (!wait_queue.empty() && bandwidth_changed && put_success) {
             Flow wait_flow = wait_queue.top();
             wait_queue.pop();
@@ -279,6 +316,7 @@ int main() {
             read_files(data_path, flows, ports);
             // 流调度
             solve(flows, ports, data_path);
+            std::cout << "data " << data_num << " done" << std::endl;
             data_num++;
         } else {
             // 终止遍历
