@@ -291,8 +291,6 @@ int algorithm(vector<Flow>& flows, vector<Port>& ports, vector<Result>& res, int
 		updateport(ports, time);
 	}
 
-
-
 	for (const auto& flow : flows)
 	{
 		if (!flow.issend)
@@ -350,7 +348,7 @@ int main()
 		if (!Input(path, flows, ports, res, maxcachesize))
 			break;
 		stable_sort(res.begin(), res.end(), [](const Result& x, const Result& y) {return x.sendtime < y.sendtime; });
-		int thistime = algorithm(flows, ports, res, maxcachesize);
+		int thistime = algorithm(flows, ports, res, maxcachesize);  // 处理了一个数据集
 		double thisbest = best(flows, ports);
 		alltime += thistime;
 		allbest += thisbest;
