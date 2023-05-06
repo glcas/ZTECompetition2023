@@ -250,6 +250,15 @@ void update_ports(std::multiset<Port, ports_queue_cmp> &ports_queue, bool &bandw
 void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string &data_path) {
     THROW_PORT_ID_LIST.clear();
     std::ofstream file(data_path + "/result.txt");
+    // 计算所有流的平均占用时间与带宽
+    int total_occupied_time = 0;
+    int total_bandwidth = 0;
+    for (auto &flow: flows) {
+        total_occupied_time += flow.occupied_time;
+        total_bandwidth += flow.bandwidth;
+    }
+    double average_occupied_time =(double) total_occupied_time / flows.size();
+    double average_bandwidth =(double) total_bandwidth / flows.size();
     // flows排序按照coming_time升序->occupied_time降序->bandwidth降序
     std::sort(flows.begin(), flows.end(), [](const Flow &a, const Flow &b) {
         if (a.coming_time == b.coming_time) {
@@ -301,29 +310,29 @@ void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string
             }
         }
         // 若调度区已满，且有排队区满&最大带宽大于流宽的端口，把等待队列中流拿出来在此处抛弃
-//        if (wait_queue.size() >= MAX_POOL_SIZE && !THROW_PORT_ID_LIST.empty() && wait_queue.begin()->occupied_time<=20) { //
-//            Flow wait_flow = *wait_queue.begin();
-//            wait_queue.erase(wait_queue.begin());
-//            for (auto port_id: THROW_PORT_ID_LIST) {
-//                auto port = std::find_if(ports_queue.begin(), ports_queue.end(), [port_id](const Port &port) {
-//                    return port.id == port_id;
-//                });
-//                if (port->max_bandwidth >= wait_flow.bandwidth) {
-//                    // 更新flow的send_port
-//                    wait_flow.send_port = port_id;
-//                    // 更新flow的send_time
-//                    wait_flow.send_time = time;
-//                    // 写出安排结果
-//                    int send_time = wait_flow.send_time > wait_flow.coming_time ? wait_flow.send_time : wait_flow.coming_time;
-//                    file << wait_flow.id << "," << wait_flow.send_port << "," << send_time << std::endl;
-//                    break;
-//                }
-//            }
-//            // 到此，若找不到能抛弃的端口，将其放回队列
-//            if (wait_flow.send_port == -1) {
-//                wait_queue.insert(wait_flow);
-//            }
-//        }
+        if (wait_queue.size() >= MAX_POOL_SIZE && !THROW_PORT_ID_LIST.empty() && wait_queue.begin()->bandwidth>average_bandwidth) { //
+            Flow wait_flow = *wait_queue.begin();
+            wait_queue.erase(wait_queue.begin());
+            for (auto port_id: THROW_PORT_ID_LIST) {
+                auto port = std::find_if(ports_queue.begin(), ports_queue.end(), [port_id](const Port &port) {
+                    return port.id == port_id;
+                });
+                if (port->max_bandwidth >= wait_flow.bandwidth) {
+                    // 更新flow的send_port
+                    wait_flow.send_port = port_id;
+                    // 更新flow的send_time
+                    wait_flow.send_time = time;
+                    // 写出安排结果
+                    int send_time = wait_flow.send_time > wait_flow.coming_time ? wait_flow.send_time : wait_flow.coming_time;
+                    file << wait_flow.id << "," << wait_flow.send_port << "," << send_time << std::endl;
+                    break;
+                }
+            }
+            // 到此，若找不到能抛弃的端口，将其放回队列
+            if (wait_flow.send_port == -1) {
+                wait_queue.insert(wait_flow);
+            }
+        }
         // 看等待队列中的首num个流是否可以放置
         // 若首个流放置了，继续看等待队列中的首num个流是否可以放置
         int see_num = 1;
