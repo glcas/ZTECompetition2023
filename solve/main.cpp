@@ -1,6 +1,7 @@
 #pragma GCC optimize(3)
 #pragma GCC optimize("inline")
 
+#include "ctime"
 #include <iostream>
 #include <sstream>
 #include <algorithm>
@@ -8,6 +9,13 @@
 #include "vector"
 #include "sys/stat.h"
 #include "fstream"
+#include "map"
+#include "set"
+#include "queue"
+#include "list"
+
+// 调度区最大容量
+int MAX_POOL_SIZE;
 
 class Flow {
 public:
@@ -15,7 +23,6 @@ public:
     int bandwidth;
     int coming_time;
     int occupied_time; // 在端口上的占用时间
-    bool is_sent; // 是否已经发送
     int send_time; // 发送时间
     int send_port; // 发送端口
 public:
@@ -24,7 +31,6 @@ public:
         this->bandwidth = bandwidth;
         this->coming_time = coming_time;
         this->occupied_time = occupied_time;
-        this->is_sent = false;
         this->send_time = -1;
         this->send_port = -1;
     }
@@ -33,70 +39,287 @@ public:
 class Port {
 public:
     int id;
+    // 端口的最大（初始）带宽
+    int max_bandwidth;
+    // 端口的当前空闲带宽
     int bandwidth_capacity;
+    // list of (remaining_time, bandwidth)
+    // 储存了端口中已发送的每个flow的剩余时间和带宽
+    std::list<std::pair<int, int>> occupies;
+    // 端口的排队区
+    std::queue<Flow> wait_queue;
+
 public:
     Port(int id, int bandwidth_capacity) {
         this->id = id;
+        this->max_bandwidth = bandwidth_capacity;
         this->bandwidth_capacity = bandwidth_capacity;
     }
 };
 
-void read_files(const std::string& data_path, std::vector<Flow> &flows, std::vector<Port> &ports) {
+void read_files(const std::string &data_path, std::vector<Flow> &flows, std::vector<Port> &ports) {
     // 读取flows.txt
     std::ifstream file(data_path + "/flow.txt");
-    // skip first line
     std::string line;
-    std::getline(file, line);
-    while (std::getline(file, line)) {
-        // 读取一行
-        std::string id, bandwidth, coming_time, process_time;
-        std::stringstream ss(line);
-        std::getline(ss, id, ',');
-        std::getline(ss, bandwidth, ',');
-        std::getline(ss, coming_time, ',');
-        std::getline(ss, process_time);
-        // 添加到flows
-        flows.emplace_back(std::stoi(id), std::stoi(bandwidth), std::stoi(coming_time), std::stoi(process_time));
+    if (file.is_open()) {
+        // 跳过首行
+        std::getline(file, line);
+        while (std::getline(file, line)) {
+            // 读取一行
+            std::string id, bandwidth, coming_time, process_time;
+            std::stringstream ss(line);
+            std::getline(ss, id, ',');
+            std::getline(ss, bandwidth, ',');
+            std::getline(ss, coming_time, ',');
+            std::getline(ss, process_time);
+            // 添加到flows
+            flows.emplace_back(std::stoi(id), std::stoi(bandwidth), std::stoi(coming_time), std::stoi(process_time));
+        }
+        file.close();
     }
-    file.close();
     // 读取ports.txt
     file.open(data_path + "/port.txt");
-    // skip first line
-    std::getline(file, line);
-    while (std::getline(file, line)) {
-        // 读取一行
-        std::string id, bandwidth_capacity;
-        std::stringstream ss(line);
-        std::getline(ss, id, ',');
-        std::getline(ss, bandwidth_capacity);
-        // 添加到ports
-        ports.emplace_back(std::stoi(id), std::stoi(bandwidth_capacity));
+    if (file.is_open()) {
+        // 跳过首行
+        std::getline(file, line);
+        while (std::getline(file, line)) {
+            // 读取一行
+            std::string id, bandwidth_capacity;
+            std::stringstream ss(line);
+            std::getline(ss, id, ',');
+            std::getline(ss, bandwidth_capacity);
+            // 添加到ports
+            ports.emplace_back(std::stoi(id), std::stoi(bandwidth_capacity));
+        }
+        file.close();
     }
 }
 
-void solve(std::vector<Flow> &flows, std::vector<Port> &ports) {
+//ports排序按照bandwidth_capacity升序
+class ports_queue_cmp {
+public:
+    bool operator()(const Port &a, const Port &b) const {
+        return a.bandwidth_capacity < b.bandwidth_capacity;
+    }
+};
 
+// wait_queue的排序仿函数
+class wait_queue_cmp {
+public:
+    bool operator()(const Flow &a, const Flow &b) const {
+        return a.occupied_time < b.occupied_time;
+    }
+};
+
+// 遍历端口，更新带宽容量与排队区
+void update_ports(std::multiset<Port, ports_queue_cmp> &ports_queue, bool &bandwidth_changed) {
+    // 将ports_queue中的端口暂存到临时列表中
+    std::vector<Port> temp_ports;
+    for (auto &port: ports_queue) {
+        temp_ports.emplace_back(port);
+    }
+    // 清空ports_queue
+    ports_queue.clear();
+    for (auto &port: temp_ports) {
+        // 遍历port的occupies
+        for (auto it = port.occupies.begin(); it != port.occupies.end();) {
+            if (it->first > 0) {
+                it->first--;
+                it++;
+            } else {
+                port.bandwidth_capacity += it->second;
+                it = port.occupies.erase(it);
+                bandwidth_changed = true;
+            }
+        }
+        // 若port排队区非空，且排队首元素带宽小于此时端口带宽容量，发出
+        if (!port.wait_queue.empty()) {
+            Flow first_flow = port.wait_queue.front();
+            if (first_flow.bandwidth <= port.bandwidth_capacity) {
+                // 更新port的带宽容量
+                port.bandwidth_capacity -= first_flow.bandwidth;
+                // 更新port的occupies
+                port.occupies.emplace_back(first_flow.occupied_time, first_flow.bandwidth);
+                port.wait_queue.pop();
+            }
+        }
+        ports_queue.insert(port);
+    }
 }
 
-void write_result(const std::string& data_path, const std::vector<Flow>& flows) {
+bool put_flow(Flow &flow, int time, std::multiset<Port, ports_queue_cmp> &ports_queue,
+              std::multiset<Flow, wait_queue_cmp> &wait_queue,
+              std::ofstream &file) {
+    // 端口临时列表，暂存已经访问过的端口
+    std::vector<Port> temp_ports;
+    // 遍历端口，尝试找到能放得下本流的端口
+    while (!ports_queue.empty()) {
+        Port port = *ports_queue.begin();
+        ports_queue.erase(ports_queue.begin());
+        // 发出本流当：1.本流带宽小于该端口带宽容量 2.调度区已满且本流带宽小于该端口最大容量
+        if (flow.bandwidth <= port.bandwidth_capacity) {
+            // 更新flow的send_port
+            flow.send_port = port.id;
+            // 更新flow的send_time
+            flow.send_time = time;
+            // 写出安排结果
+            file << flow.id << "," << flow.send_port << "," << flow.send_time << std::endl;
+            // 更新port的带宽容量
+            port.bandwidth_capacity -= flow.bandwidth;
+            // 更新port的occupies
+            port.occupies.emplace_back(flow.occupied_time, flow.bandwidth);
+            // 将该端口放入临时队列中
+            temp_ports.emplace_back(port);
+            // 跳出循环
+            break;
+        } else if (flow.bandwidth <= port.max_bandwidth && wait_queue.size() >= MAX_POOL_SIZE) {
+            flow.send_port = port.id;
+            flow.send_time = time;
+            file << flow.id << "," << flow.send_port << "," << flow.send_time << std::endl;
+            // 若本port的排队区流数量小于30，send_port的排队区加入本流；否则，该流在该端口被抛弃
+            if (port.wait_queue.size() < 30)
+                port.wait_queue.push(flow);
+            // 将该端口放入临时队列中
+            temp_ports.emplace_back(port);
+            // 跳出循环
+            break;
+        } else {
+            // 将该端口放入临时队列中
+            temp_ports.emplace_back(port);
+            // 查看下一个当前带宽容量更大的端口能否放下
+            continue;
+        }
+    }
+    // 将临时列表端口放回有序列表
+    for (auto &temp_port: temp_ports) {
+        ports_queue.insert(temp_port);
+    }
+    // 结束时，若flow的send_port仍为-1，说明没有找到能放得下本流的端口
+    if (flow.send_port == -1) {
+        return false;
+    } else {
+        return true;
+    }
+}
+
+// 看等待队列中的首SEE_NUM个流是否可以发出
+// 若首个流发出了，继续看等待队列中的首SEE_NUM个流是否可以发出
+void check_flows(std::multiset<Port, ports_queue_cmp> &ports_queue,
+                 std::multiset<Flow, wait_queue_cmp> &wait_queue,
+                 std::ofstream &file, int time, int see_num) {
+    // 发出流是否成功的标志
+    bool put_success;
+    int see_counter = see_num;
+    auto wait_flow_it = wait_queue.begin();
+    while (!wait_queue.empty() && wait_flow_it != wait_queue.end() && see_counter) {
+        Flow wait_flow = *wait_flow_it;
+        wait_flow_it = wait_queue.erase(wait_flow_it);
+        put_success = put_flow(wait_flow, time, ports_queue, wait_queue, file);
+        if (put_success) {
+            see_counter = see_num;
+        } else {
+            // 将本流放回等待队列，等待队列不变
+            wait_flow_it = ++wait_queue.insert(wait_flow);
+            see_counter--;
+        }
+    }
+}
+
+void solve(std::vector<Flow> &flows, std::vector<Port> &ports, const std::string &data_path) {
     std::ofstream file(data_path + "/result.txt");
-    for (const auto& flow : flows) {
-        file << flow.id << "," << flow.send_port << "," << flow.send_time << std::endl;
+    // 计算所有流的平均带宽
+    int total_bandwidth = 0;
+    for (auto &flow: flows) {
+        total_bandwidth += flow.bandwidth;
     }
-    file.close();
-}
-
-void write_sorted_flows(const std::string& data_path, const std::vector<Flow>& flows) {
-    std::ofstream file(data_path + "/sorted_flows.txt");
-    for (const auto& flow : flows) {
-        file << flow.id << "," << flow.bandwidth << "," << flow.coming_time << "," << flow.occupied_time << std::endl;
+    double average_bandwidth = (double) total_bandwidth / (int) flows.size();
+    // flows排序按照coming_time升序->occupied_time升序->bandwidth降序
+    std::sort(flows.begin(), flows.end(), [](const Flow &a, const Flow &b) {
+        if (a.coming_time == b.coming_time) {
+            if (a.occupied_time == b.occupied_time) {
+                return a.bandwidth > b.bandwidth;
+            } else {
+                return a.occupied_time < b.occupied_time;
+            }
+        } else {
+            return a.coming_time < b.coming_time;
+        }
+    });
+    // ports排序按照ports_queue_cmp规则
+    std::multiset<Port, ports_queue_cmp> ports_queue;
+    for (auto &port: ports) {
+        ports_queue.insert(port);
+    }
+    // 调度区的流，按照wait_queue_cmp规则排序
+    // 该队列的大小即为当前调度区中流的数量
+    std::multiset<Flow, wait_queue_cmp> wait_queue;
+    // 计时器
+    int time = 0;
+    // 调度区最大容量
+    MAX_POOL_SIZE = int(ports_queue.size()) * 20;
+    // 带宽是否发生变化的标志，作为剪枝，避免无意义地尝试发出流
+    bool bandwidth_changed;
+    for (auto &flow: flows) {
+        wait_queue.insert(flow);
+        // 当前流的到达时间大于程序中存储的时间，更新时间
+        if (flow.coming_time > time) {
+            for (int i = 0; i < flow.coming_time - time; i++) {
+                update_ports(ports_queue, bandwidth_changed);
+            }
+            // 状态更新完毕，更新时间
+            time = flow.coming_time;
+        }
+        // 遍历ports_queue，找到所有排队区满的端口，将其放入throw_port_id_list中
+        std::vector<int> throw_port_id_list;
+        for (auto &port: ports_queue) {
+            if (port.wait_queue.size() >= 30) {
+                throw_port_id_list.push_back(port.id);
+            }
+        }
+        // 若调度区已满，且有排队区满以及最大带宽大于流宽的端口，把等待队列中首流拿出来在此端口抛弃
+        if (wait_queue.size() >= MAX_POOL_SIZE && !throw_port_id_list.empty() &&
+            wait_queue.begin()->bandwidth > average_bandwidth) {
+            Flow wait_flow = *wait_queue.begin();
+            wait_queue.erase(wait_queue.begin());
+            for (auto port_id: throw_port_id_list) {
+                auto port = std::find_if(ports_queue.begin(), ports_queue.end(), [port_id](const Port &port) {
+                    return port.id == port_id;
+                });
+                if (port->max_bandwidth >= wait_flow.bandwidth) {
+                    wait_flow.send_port = port_id;
+                    wait_flow.send_time = time;
+                    file << wait_flow.id << "," << wait_flow.send_port << "," << wait_flow.send_time << std::endl;
+                    break;
+                }
+            }
+            // 到此，若找不到能抛弃的端口，将其放回队列
+            if (wait_flow.send_port == -1) {
+                wait_queue.insert(wait_flow);
+            }
+        }
+        if (bandwidth_changed) {
+            check_flows(ports_queue, wait_queue, file, time, 5);
+        } else {
+            check_flows(ports_queue, wait_queue, file, time, 1);
+        }
+    }
+    // 读取flow结束，等待时间中的各流可视为同时到达，此时wait_queue只有出没有入，不可能爆调度区
+    while (!wait_queue.empty()) {
+        // 更新时间
+        time++;
+        bandwidth_changed = false;
+        update_ports(ports_queue, bandwidth_changed);
+        if (bandwidth_changed) {
+            check_flows(ports_queue, wait_queue, file, time, 5);
+        }
     }
     file.close();
 }
 
 // 输出文件result不加第一行描述，不用排序，放在和输入文件同目录
 int main() {
-    int data_num=0;
+    int data_num = 0;
+    int sum_time = 0;
     // 遍历../data文件夹下的输入文件夹
     std::string data_root = "../data";
     while (true) {
@@ -104,35 +327,28 @@ int main() {
         // 判断文件夹是否存在
         struct stat s{};
         if (stat(data_path.c_str(), &s) == 0 && (s.st_mode & S_IFDIR)) {
+            // 计时开始
+            clock_t start, end;
+            start = clock();
             // data_num号样本目录存在，处理数据
             std::vector<Flow> flows;
             std::vector<Port> ports;
             read_files(data_path, flows, ports);
-            // flows排序按照coming_time升序->occupied_time降序->bandwidth降序
-            std::sort(flows.begin(), flows.end(), [](const Flow& a, const Flow& b) {
-                if (a.coming_time != b.coming_time) {
-                    return a.coming_time < b.coming_time;
-                } else if (a.occupied_time != b.occupied_time) {
-                    return a.occupied_time > b.occupied_time;
-                } else {
-                    return a.bandwidth > b.bandwidth;
-                }
-            });
-            // 测试用，看flow样本特征
-            write_sorted_flows(data_path, flows);
-            // ports按照bandwidth_capacity降序
-            std::sort(ports.begin(), ports.end(), [](const Port& a, const Port& b) {
-                return a.bandwidth_capacity > b.bandwidth_capacity;
-            });
             // 流调度
-            solve(flows, ports);
-            // 输出结果
-            write_result(data_path, flows);
+            solve(flows, ports, data_path);
+            // 计时结束
+            end = clock();
+            std::cout << "data " << data_num << " done in " << (double) (end - start) / CLOCKS_PER_SEC << "s"
+                      << std::endl;
+            // 计算总时间
+            sum_time += (end - start);
             data_num++;
         } else {
             // 终止遍历
             break;
         }
     }
+    std::cout << "total time: " << (double) sum_time / CLOCKS_PER_SEC << "s" << std::endl;
     return 0;
 }
+
